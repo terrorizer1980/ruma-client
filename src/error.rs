@@ -4,7 +4,7 @@ use std::error::Error as StdError;
 use std::fmt::{Display, Formatter, Result as FmtResult};
 
 use http::uri::InvalidUri;
-use hyper::error::Error as HyperError;
+use reqwest::Error as ReqwestError;
 use ruma_api::Error as RumaApiError;
 use serde_json::Error as SerdeJsonError;
 use serde_urlencoded::ser::Error as SerdeUrlEncodedSerializeError;
@@ -17,7 +17,8 @@ impl Display for Error {
     fn fmt(&self, f: &mut Formatter) -> FmtResult {
         let message = match self.0 {
             InnerError::AuthenticationRequired => "The queried endpoint requires authentication but was called with an anonymous client.",
-            InnerError::Hyper(_) => "An HTTP error occurred.",
+            InnerError::Reqwest(_) => "An HTTP error occurred.",
+            InnerError::ConfigurationError(_) => "Error configuring the client",
             InnerError::Uri(_) => "Provided string could not be converted into a URI.",
             InnerError::RumaApi(_) => "An error occurred converting between ruma_client_api and hyper types.",
             InnerError::SerdeJson(_) => "A serialization error occurred.",
@@ -35,8 +36,10 @@ impl StdError for Error {}
 pub(crate) enum InnerError {
     /// Queried endpoint requires authentication but was called on an anonymous client.
     AuthenticationRequired,
+    /// An error in the client configuration.
+    ConfigurationError(String),
     /// An error at the HTTP layer.
-    Hyper(HyperError),
+    Reqwest(ReqwestError),
     /// An error when parsing a string as a URI.
     Uri(InvalidUri),
     /// An error converting between ruma_client_api types and Hyper types.
@@ -45,12 +48,6 @@ pub(crate) enum InnerError {
     SerdeJson(SerdeJsonError),
     /// An error when serializing a query string value.
     SerdeUrlEncodedSerialize(SerdeUrlEncodedSerializeError),
-}
-
-impl From<HyperError> for Error {
-    fn from(error: HyperError) -> Self {
-        Self(InnerError::Hyper(error))
-    }
 }
 
 impl From<InvalidUri> for Error {
@@ -74,5 +71,11 @@ impl From<SerdeJsonError> for Error {
 impl From<SerdeUrlEncodedSerializeError> for Error {
     fn from(error: SerdeUrlEncodedSerializeError) -> Self {
         Self(InnerError::SerdeUrlEncodedSerialize(error))
+    }
+}
+
+impl From<ReqwestError> for Error {
+    fn from(error: ReqwestError) -> Self {
+        Self(InnerError::Reqwest(error))
     }
 }

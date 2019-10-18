@@ -1,132 +1,11 @@
 //! Crate `ruma_client` is a [Matrix](https://matrix.org/) client library.
 //!
-//! # Usage
-//!
-//! Begin by creating a `Client` type, usually using the `https` method for a client that supports
-//! secure connections, and then logging in:
-//!
-//! ```no_run
-//! # #![feature(impl_trait_in_bindings)]
-//! #![feature(async_await)]
-//! use ruma_client::Client;
-//!
-//! let work = async {
-//!     let homeserver_url = "https://example.com".parse().unwrap();
-//!     let client = Client::https(homeserver_url, None).unwrap();
-//!
-//!     let session = client
-//!         .log_in("@alice:example.com".to_string(), "secret".to_string(), None)
-//!         .await?;
-//!
-//!     // You're now logged in! Write the session to a file if you want to restore it later.
-//!     // Then start using the API!
-//! # Ok(())
-//! };
-//!
-//! // Start `work` on a futures runtime...
-//! # let work_typehint: impl futures::future::TryFuture<Ok = (), Error = ruma_client::Error>
-//! #     = work;
-//! ```
-//!
-//! You can also pass an existing session to the `Client` constructor to restore a previous session
-//! rather than calling `log_in`.
-//!
-//! For the standard use case of synchronizing with the homeserver (i.e. getting all the latest
-//! events), use the `Client::sync`:
-//!
-//! ```no_run
-//! # #![feature(async_await)]
-//! # use futures::stream::{StreamExt as _, TryStreamExt as _};
-//! # use ruma_client::Client;
-//! # let homeserver_url = "https://example.com".parse().unwrap();
-//! # let client = Client::https(homeserver_url, None).unwrap();
-//! # async {
-//! let mut sync_stream = Box::pin(client.sync(None, None, true));
-//! while let Some(response) = sync_stream.try_next().await? {
-//!     // Do something with the data in the response...
-//! }
-//! # Result::<(), ruma_client::Error>::Ok(())
-//! # };
-//! ```
-//!
-//! The `Client` type also provides methods for registering a new account if you don't already have
-//! one with the given homeserver.
-//!
-//! Beyond these basic convenience methods, `ruma-client` gives you access to the entire Matrix
-//! client-server API via the `api` module. Each leaf module under this tree of modules contains
-//! the necessary types for one API endpoint. Simply call the module's `call` method, passing it
-//! the logged in `Client` and the relevant `Request` type. `call` will return a future that will
-//! resolve to the relevant `Response` type.
-//!
-//! For example:
-//!
-//! ```no_run
-//! # #![feature(async_await)]
-//! # use ruma_client::Client;
-//! # let homeserver_url = "https://example.com".parse().unwrap();
-//! # let client = Client::https(homeserver_url, None).unwrap();
-//! use std::convert::TryFrom;
-//!
-//! use ruma_client::api::r0::alias::get_alias;
-//! use ruma_identifiers::{RoomAliasId, RoomId};
-//!
-//! async {
-//!     let response = client
-//!         .request(get_alias::Request {
-//!             room_alias: RoomAliasId::try_from("#example_room:example.com").unwrap(),
-//!         })
-//!         .await?;
-//!
-//!     assert_eq!(response.room_id, RoomId::try_from("!n8f893n9:example.com").unwrap());
-//! #   Result::<(), ruma_client::Error>::Ok(())
-//! }
-//! # ;
-//! ```
+use std::convert::{TryFrom, TryInto};
 
-#![deny(
-    missing_copy_implementations,
-    missing_debug_implementations,
-    missing_docs,
-    //warnings
-)]
-#![warn(
-    clippy::empty_line_after_outer_attr,
-    clippy::expl_impl_clone_on_copy,
-    clippy::if_not_else,
-    clippy::items_after_statements,
-    clippy::match_same_arms,
-    clippy::mem_forget,
-    clippy::missing_docs_in_private_items,
-    clippy::mut_mut,
-    clippy::needless_borrow,
-    clippy::needless_continue,
-    clippy::single_match_else,
-    clippy::unicode_not_nfc,
-    clippy::use_self,
-    clippy::used_underscore_binding,
-    clippy::wrong_pub_self_convention,
-    clippy::wrong_self_convention
-)]
-
-use std::{
-    convert::TryFrom,
-    str::FromStr,
-    sync::{Arc, Mutex},
-};
-
-use futures::{
-    future::Future,
-    stream::{self, Stream, TryStream, TryStreamExt as _},
-};
+use http::Method as HttpMethod;
 use http::Response as HttpResponse;
-use hyper::{
-    client::{connect::Connect, HttpConnector},
-    Client as HyperClient, Uri,
-};
-#[cfg(feature = "hyper-tls")]
-use hyper_tls::HttpsConnector;
-#[cfg(feature = "hyper-tls")]
-use native_tls::Error as NativeTlsError;
+use js_int::UInt;
+use reqwest;
 use ruma_api::Endpoint;
 use url::Url;
 
@@ -135,300 +14,216 @@ use crate::error::InnerError;
 pub use crate::{error::Error, session::Session};
 pub use ruma_client_api as api;
 pub use ruma_events as events;
-pub use ruma_identifiers as identifiers;
 
-/// Matrix client-server API endpoints.
 //pub mod api;
 mod error;
 mod session;
 
-/// A client for the Matrix client-server API.
 #[derive(Debug)]
-pub struct Client<C: Connect>(Arc<ClientData<C>>);
-
-/// Data contained in Client's Rc
-#[derive(Debug)]
-struct ClientData<C>
-where
-    C: Connect,
-{
+pub struct AsyncClient {
     /// The URL of the homeserver to connect to.
-    homeserver_url: Url,
+    homeserver: Url,
     /// The underlying HTTP client.
-    hyper: HyperClient<C>,
+    client: reqwest::Client,
     /// User session data.
-    session: Mutex<Option<Session>>,
+    session: Option<Session>,
 }
 
-/// Non-secured variant of the client (using plain HTTP requests)
-pub type HttpClient = Client<HttpConnector>;
-
-impl HttpClient {
-    /// Creates a new client for making HTTP requests to the given homeserver.
-    pub fn new(homeserver_url: Url, session: Option<Session>) -> Self {
-        Self(Arc::new(ClientData {
-            homeserver_url,
-            hyper: HyperClient::builder().keep_alive(true).build_http(),
-            session: Mutex::new(session),
-        }))
-    }
-
-    /// Get a copy of the current `Session`, if any.
-    ///
-    /// Useful for serializing and persisting the session to be restored later.
-    pub fn session(&self) -> Option<Session> {
-        self.0
-            .session
-            .lock()
-            .expect("session mutex was poisoned")
-            .clone()
-    }
+#[derive(Default, Debug)]
+pub struct AsyncClientConfig {
+    proxy: Option<reqwest::Proxy>,
+    use_sys_proxy: bool,
+    disable_ssl_verification: bool,
 }
 
-/// Secured variant of the client (using HTTPS requests)
-#[cfg(feature = "tls")]
-pub type HttpsClient = Client<HttpsConnector<HttpConnector>>;
-
-#[cfg(feature = "tls")]
-impl HttpsClient {
-    /// Creates a new client for making HTTPS requests to the given homeserver.
-    pub fn https(homeserver_url: Url, session: Option<Session>) -> Result<Self, NativeTlsError> {
-        let connector = HttpsConnector::new()?;
-
-        Ok(Self(Arc::new(ClientData {
-            homeserver_url,
-            hyper: HyperClient::builder().keep_alive(true).build(connector),
-            session: Mutex::new(session),
-        })))
-    }
-}
-
-impl<C> Client<C>
-where
-    C: Connect + 'static,
-{
-    /// Creates a new client using the given `hyper::Client`.
-    ///
-    /// This allows the user to configure the details of HTTP as desired.
-    pub fn custom(
-        hyper_client: HyperClient<C>,
-        homeserver_url: Url,
-        session: Option<Session>,
-    ) -> Self {
-        Self(Arc::new(ClientData {
-            homeserver_url,
-            hyper: hyper_client,
-            session: Mutex::new(session),
-        }))
+impl AsyncClientConfig {
+    pub fn new() -> Self {
+        Default::default()
     }
 
-    /// Log in with a username and password.
-    ///
-    /// In contrast to api::r0::session::login::call(), this method stores the
-    /// session data returned by the endpoint in this client, instead of
-    /// returning it.
-    pub async fn log_in(
-        &self,
-        user: String,
-        password: String,
-        device_id: Option<String>,
-    ) -> Result<Session, Error> {
-        use api::r0::session::login;
-
-        let response = self
-            .request(login::Request {
-                address: None,
-                login_type: login::LoginType::Password,
-                medium: None,
-                device_id,
-                password,
-                user,
-            })
-            .await?;
-
-        let session = Session {
-            access_token: response.access_token,
-            device_id: response.device_id,
-            user_id: response.user_id,
-        };
-        *self.0.session.lock().unwrap() = Some(session.clone());
-
-        Ok(session)
-    }
-
-    /// Register as a guest. In contrast to api::r0::account::register::call(),
-    /// this method stores the session data returned by the endpoint in this
-    /// client, instead of returning it.
-    pub async fn register_guest(&self) -> Result<Session, Error> {
-        use api::r0::account::register;
-
-        let response = self
-            .request(register::Request {
-                auth: None,
-                bind_email: None,
-                device_id: None,
-                initial_device_display_name: None,
-                kind: Some(register::RegistrationKind::Guest),
-                password: None,
-                username: None,
-            })
-            .await?;
-
-        let session = Session {
-            access_token: response.access_token,
-            device_id: response.device_id,
-            user_id: response.user_id,
-        };
-        *self.0.session.lock().unwrap() = Some(session.clone());
-
-        Ok(session)
-    }
-
-    /// Register as a new user on this server.
-    ///
-    /// In contrast to api::r0::account::register::call(), this method stores
-    /// the session data returned by the endpoint in this client, instead of
-    /// returning it.
-    ///
-    /// The username is the local part of the returned user_id. If it is
-    /// omitted from this request, the server will generate one.
-    pub async fn register_user(
-        &self,
-        username: Option<String>,
-        password: String,
-    ) -> Result<Session, Error> {
-        use api::r0::account::register;
-
-        let response = self
-            .request(register::Request {
-                auth: None,
-                bind_email: None,
-                device_id: None,
-                initial_device_display_name: None,
-                kind: Some(register::RegistrationKind::User),
-                password: Some(password),
-                username,
-            })
-            .await?;
-
-        let session = Session {
-            access_token: response.access_token,
-            device_id: response.device_id,
-            user_id: response.user_id,
-        };
-        *self.0.session.lock().unwrap() = Some(session.clone());
-
-        Ok(session)
-    }
-
-    /// Convenience method that represents repeated calls to the sync_events endpoint as a stream.
-    ///
-    /// If the since parameter is None, the first Item might take a significant time to arrive and
-    /// be deserialized, because it contains all events that have occured in the whole lifetime of
-    /// the logged-in users account and are visible to them.
-    pub fn sync(
-        &self,
-        filter: Option<api::r0::sync::sync_events::Filter>,
-        since: Option<String>,
-        set_presence: bool,
-    ) -> impl Stream<Item = Result<api::r0::sync::sync_events::Response, Error>>
-           + TryStream<Ok = api::r0::sync::sync_events::Response, Error = Error> {
-        use api::r0::sync::sync_events;
-
-        // TODO: Is this really the way TryStreams are supposed to work?
-        #[derive(Debug, PartialEq, Eq)]
-        enum State {
-            InitialSync,
-            Since(String),
-            Errored,
+    pub fn proxy(mut self, proxy: &str) -> Result<Self, Error> {
+        if self.use_sys_proxy {
+            return Err(Error(InnerError::ConfigurationError(
+                "Using the system proxy has been previously configured.".to_string(),
+            )));
         }
+        self.proxy = Some(reqwest::Proxy::all(proxy)?);
+        Ok(self)
+    }
 
-        let client = self.clone();
-        let set_presence = if set_presence {
-            None
-        } else {
-            Some(sync_events::SetPresence::Offline)
-        };
+    pub fn use_sys_proxy(mut self) -> Result<Self, Error> {
+        if self.proxy.is_some() {
+            return Err(Error(InnerError::ConfigurationError(
+                "A proxy has already been configured.".to_string(),
+            )));
+        }
+        self.use_sys_proxy = true;
+        Ok(self)
+    }
 
-        let initial_state = match since {
-            Some(s) => State::Since(s),
-            None => State::InitialSync,
-        };
+    pub fn disable_ssl_verification(mut self) -> Self {
+        self.disable_ssl_verification = true;
+        self
+    }
+}
 
-        stream::unfold(initial_state, move |state| {
-            let client = client.clone();
-            let filter = filter.clone();
+#[derive(Debug, Default)]
+pub struct SyncSettings {
+    pub(crate) timeout: Option<UInt>,
+    pub(crate) token: Option<String>,
+    pub(crate) full_state: Option<bool>,
+}
 
-            async move {
-                let since = match state {
-                    State::Errored => return None,
-                    State::Since(s) => Some(s),
-                    State::InitialSync => None,
-                };
+impl SyncSettings {
+    pub fn new() -> Self {
+        Default::default()
+    }
 
-                let res = client
-                    .request(sync_events::Request {
-                        filter,
-                        since,
-                        full_state: None,
-                        set_presence: set_presence.clone(),
-                        timeout: None,
-                    })
-                    .await;
+    pub fn token<S: Into<String>>(mut self, token: S) -> Self {
+        self.token = Some(token.into());
+        self
+    }
 
-                match res {
-                    Ok(response) => {
-                        let next_batch_clone = response.next_batch.clone();
-                        Some((Ok(response), State::Since(next_batch_clone)))
-                    }
-                    Err(e) => Some((Err(e.into()), State::Errored)),
-                }
-            }
+    pub fn timeout<T: TryInto<UInt>>(mut self, timeout: T) -> Result<Self, js_int::TryFromIntError>
+    where
+        js_int::TryFromIntError:
+            std::convert::From<<T as std::convert::TryInto<js_int::UInt>>::Error>,
+    {
+        self.timeout = Some(timeout.try_into()?);
+        Ok(self)
+    }
+
+    pub fn full_state(mut self, full_state: bool) -> Self {
+        self.full_state = Some(full_state);
+        self
+    }
+}
+
+use api::r0::session::login;
+use api::r0::sync::sync_events;
+
+impl AsyncClient {
+    /// Creates a new client for making HTTP requests to the given homeserver.
+    pub fn new(homeserver_url: &str, session: Option<Session>) -> Result<Self, url::ParseError> {
+        let homeserver = Url::parse(homeserver_url)?;
+        let client = reqwest::Client::new();
+
+        Ok(Self {
+            homeserver,
+            client,
+            session,
         })
     }
 
-    /// Makes a request to a Matrix API endpoint.
-    pub fn request<Request: Endpoint>(
-        &self,
-        request: Request,
-    ) -> impl Future<Output = Result<Request::Response, Error>> {
-        let client = self.0.clone();
+    pub fn new_with_config(
+        homeserver_url: &str,
+        session: Option<Session>,
+        config: AsyncClientConfig,
+    ) -> Result<Self, url::ParseError> {
+        let homeserver = Url::parse(homeserver_url)?;
+        let client = reqwest::Client::builder();
 
-        async move {
-            let mut url = client.homeserver_url.clone();
+        let client = if config.disable_ssl_verification {
+            client.danger_accept_invalid_certs(true)
+        } else {
+            client
+        };
 
-            let mut hyper_request = request.try_into()?.map(hyper::Body::from);
+        let client = match config.proxy {
+            Some(p) => client.proxy(p),
+            None => client,
+        };
 
-            {
-                let uri = hyper_request.uri();
+        let client = if config.use_sys_proxy {
+            client.use_sys_proxy()
+        } else {
+            client
+        };
 
-                url.set_path(uri.path());
-                url.set_query(uri.query());
+        let client = client.build().unwrap();
 
-                if Request::METADATA.requires_authentication {
-                    if let Some(ref session) = *client.session.lock().unwrap() {
-                        url.query_pairs_mut()
-                            .append_pair("access_token", &session.access_token);
-                    } else {
-                        return Err(Error(InnerError::AuthenticationRequired));
-                    }
-                }
-            }
-
-            *hyper_request.uri_mut() = Uri::from_str(url.as_ref())?;
-
-            let hyper_response = client.hyper.request(hyper_request).await?;
-            let (head, body) = hyper_response.into_parts();
-            let full_response =
-                HttpResponse::from_parts(head, body.try_concat().await?.as_ref().to_owned());
-
-            Ok(Request::Response::try_from(full_response)?)
-        }
+        Ok(Self {
+            homeserver,
+            client,
+            session,
+        })
     }
-}
 
-impl<C: Connect> Clone for Client<C> {
-    fn clone(&self) -> Self {
-        Self(self.0.clone())
+    pub async fn login<S: Into<String>>(
+        &mut self,
+        user: S,
+        password: S,
+        device_id: Option<S>,
+    ) -> Result<login::Response, Error> {
+        let request = login::Request {
+            address: None,
+            login_type: login::LoginType::Password,
+            medium: None,
+            device_id: device_id.map(|d| d.into()),
+            password: password.into(),
+            user: user.into(),
+        };
+
+        let response = self.send(request).await.unwrap();
+
+        let session = Session {
+            access_token: response.access_token.clone(),
+            device_id: response.device_id.clone(),
+            user_id: response.user_id.clone(),
+        };
+
+        self.session = Some(session.clone());
+
+        Ok(response)
+    }
+
+    pub async fn sync(&self, sync_settings: SyncSettings) -> Result<sync_events::Response, Error> {
+        let request = sync_events::Request {
+            filter: None,
+            since: sync_settings.token,
+            full_state: sync_settings.full_state,
+            set_presence: None,
+            timeout: sync_settings.timeout,
+        };
+
+        let response = self.send(request).await.unwrap();
+
+        Ok(response)
+    }
+
+    async fn send<Request: Endpoint>(&self, request: Request) -> Result<Request::Response, Error> {
+        let request: http::Request<Vec<u8>> = request.try_into()?;
+        let url = request.uri();
+        let url = self.homeserver.join(url.path()).unwrap();
+
+        let request_builder = match Request::METADATA.method {
+            HttpMethod::GET => self.client.get(url),
+            HttpMethod::POST => {
+                let body = request.body().clone();
+                self.client.post(url).body(body)
+            }
+            HttpMethod::PUT => unimplemented!(),
+            HttpMethod::DELETE => unimplemented!(),
+            _ => panic!("Unsuported method"),
+        };
+
+        let request_builder = if Request::METADATA.requires_authentication {
+            if let Some(ref session) = self.session {
+                request_builder.bearer_auth(&session.access_token)
+            } else {
+                return Err(Error(InnerError::AuthenticationRequired));
+            }
+        } else {
+            request_builder
+        };
+
+        let response = request_builder.send().await?;
+
+        let status = response.status();
+        let body = response.bytes().await?.as_ref().to_owned();
+        let response = HttpResponse::builder().status(status).body(body).unwrap();
+        let response = Request::Response::try_from(response)?;
+
+        Ok(response)
     }
 }
